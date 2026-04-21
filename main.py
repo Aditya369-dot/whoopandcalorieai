@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from db import get_conn, get_whoop_tokens, init_db, save_whoop_tokens
 from food_import import parse_netdiary_csv
-from recommender import next_meal_target
+from recommender import next_meal_target, recommend_next_meal
 from whoop_client import WhoopClient, WhoopClientError
 
 
@@ -34,6 +34,68 @@ WHOOP_DEFAULT_SCOPES = (
 class ImportResponse(BaseModel):
     inserted_rows: int
     day_detected: str
+
+
+def _load_day_consumed(day: str) -> dict:
+    conn = get_conn()
+    cur = conn.cursor()
+
+    row = cur.execute(
+        """
+        SELECT
+            COALESCE(SUM(calories), 0),
+            COALESCE(SUM(protein_g), 0),
+            COALESCE(SUM(carbs_g), 0),
+            COALESCE(SUM(fat_g), 0)
+        FROM food_logs
+        WHERE day=?
+        """,
+        (day,),
+    ).fetchone()
+
+    conn.close()
+
+    return {
+        "calories": float(row[0] or 0),
+        "protein_g": float(row[1] or 0),
+        "carbs_g": float(row[2] or 0),
+        "fat_g": float(row[3] or 0),
+    }
+
+
+def _load_whoop_snapshot(day: str) -> tuple[Optional[dict], Optional[str]]:
+    try:
+        client = _whoop_client_from_storage()
+        snapshot = client.get_daily_snapshot(day)
+        return snapshot.model_dump(), None
+    except HTTPException as exc:
+        if exc.status_code == 400:
+            return None, exc.detail
+        raise
+    except WhoopClientError as exc:
+        return None, str(exc)
+
+
+def _summarize_whoop_day(snapshot: dict) -> dict:
+    cycle_score = ((snapshot.get("cycle") or {}).get("score") or {}) if isinstance(snapshot, dict) else {}
+    recovery_score = (((snapshot.get("recovery") or {}).get("score") or {}) if isinstance(snapshot, dict) else {})
+    sleep_score = (((snapshot.get("sleep") or {}).get("score") or {}) if isinstance(snapshot, dict) else {})
+    sleep_stage = (sleep_score.get("stage_summary") or {}) if isinstance(sleep_score, dict) else {}
+
+    total_sleep_milli = (
+        float(sleep_stage.get("total_light_sleep_time_milli") or 0)
+        + float(sleep_stage.get("total_slow_wave_sleep_time_milli") or 0)
+        + float(sleep_stage.get("total_rem_sleep_time_milli") or 0)
+    )
+
+    return {
+        "strain": cycle_score.get("strain"),
+        "recovery": recovery_score.get("recovery_score"),
+        "sleep_performance": sleep_score.get("sleep_performance_percentage"),
+        "sleep_hours": round(total_sleep_milli / 3600000.0, 2) if total_sleep_milli else None,
+        "hrv_rmssd_milli": recovery_score.get("hrv_rmssd_milli"),
+        "resting_heart_rate": recovery_score.get("resting_heart_rate"),
+    }
 
 
 @asynccontextmanager
@@ -241,6 +303,22 @@ def whoop_recovery_current():
     return recovery.model_dump()
 
 
+@app.get("/whoop/day")
+def whoop_day(day: Optional[str] = Query(default=None, description="YYYY-MM-DD")):
+    client = _whoop_client_from_storage()
+    try:
+        snapshot = client.get_daily_snapshot(day)
+    except WhoopClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    snapshot_data = snapshot.model_dump()
+    return {
+        "date": snapshot_data.get("date") or day,
+        "metrics": _summarize_whoop_day(snapshot_data),
+        "snapshot": snapshot_data,
+    }
+
+
 @app.post("/import/netdiary", response_model=ImportResponse)
 async def import_netdiary(
     file: UploadFile = File(...),
@@ -307,30 +385,7 @@ def summary_day(
     Summarize consumed macros for a given day and return a next-meal target.
     Goals are passed as query params (no GET body).
     """
-    conn = get_conn()
-    cur = conn.cursor()
-
-    row = cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(calories), 0),
-            COALESCE(SUM(protein_g), 0),
-            COALESCE(SUM(carbs_g), 0),
-            COALESCE(SUM(fat_g), 0)
-        FROM food_logs
-        WHERE day=?
-        """,
-        (day,),
-    ).fetchone()
-
-    conn.close()
-
-    consumed = {
-        "calories": float(row[0] or 0),
-        "protein_g": float(row[1] or 0),
-        "carbs_g": float(row[2] or 0),
-        "fat_g": float(row[3] or 0),
-    }
+    consumed = _load_day_consumed(day)
 
     goals = {
         "calories": calories,
@@ -350,5 +405,46 @@ def summary_day(
         "goals": goals,
         "remaining": remaining,
         "next_meal_target": next_meal,
+    }
+
+
+@app.get("/recommendation/day")
+def recommendation_day(
+    day: str = Query(..., description="YYYY-MM-DD"),
+    calories: float = Query(2000, ge=0),
+    protein_g: float = Query(160, ge=0),
+    carbs_g: float = Query(180, ge=0),
+    fat_g: float = Query(70, ge=0),
+    insulin_resistant: bool = Query(False),
+    include_whoop: bool = Query(True),
+):
+    consumed = _load_day_consumed(day)
+    goals = {
+        "calories": calories,
+        "protein_g": protein_g,
+        "carbs_g": carbs_g,
+        "fat_g": fat_g,
+    }
+
+    whoop_snapshot = None
+    whoop_warning = None
+    if include_whoop:
+        whoop_snapshot, whoop_warning = _load_whoop_snapshot(day)
+
+    recommendation = recommend_next_meal(
+        consumed,
+        goals,
+        whoop_snapshot=whoop_snapshot,
+        insulin_resistant=insulin_resistant,
+    )
+
+    return {
+        "day": day,
+        "consumed": consumed,
+        "goals": goals,
+        "insulin_resistant": insulin_resistant,
+        "whoop_snapshot_available": whoop_snapshot is not None,
+        "whoop_warning": whoop_warning,
+        **recommendation,
     }
 

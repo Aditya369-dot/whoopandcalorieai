@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Dict
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import streamlit as st
 
@@ -9,6 +12,9 @@ from db import get_conn, init_db
 from food_import import parse_netdiary_csv
 from recommender import next_meal_target
 from whoop_client import WhoopClient, WhoopClientError
+
+
+API_BASE_URL = "http://127.0.0.1:8000"
 
 
 def load_day_summary(day: str) -> Dict[str, float]:
@@ -63,6 +69,21 @@ def insert_food_rows(rows: list[dict]) -> int:
     conn.commit()
     conn.close()
     return inserted
+
+
+def fetch_api_json(path: str, query: dict | None = None) -> dict:
+    url = f"{API_BASE_URL}{path}"
+    if query:
+        url = f"{url}?{urlencode(query)}"
+
+    try:
+        with urlopen(url, timeout=20) as response:
+            return __import__("json").loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"API error {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Unable to reach backend API: {exc.reason}") from exc
 
 
 def render_privacy_policy() -> None:
@@ -130,6 +151,28 @@ def render_whoop_status() -> None:
     cols[2].metric("RHR", f"{recovery.score.resting_heart_rate or 0} bpm")
 
 
+def render_whoop_day_overview(day_str: str) -> None:
+    st.subheader("WHOOP Day")
+    st.caption("Core WHOOP metrics for the selected day.")
+
+    try:
+        payload = fetch_api_json("/whoop/day", {"day": day_str})
+    except RuntimeError as exc:
+        st.info(f"WHOOP day metrics are not available yet. {exc}")
+        return
+
+    metrics = payload.get("metrics") or {}
+    cols = st.columns(3)
+    cols[0].metric("Strain", f"{float(metrics.get('strain') or 0):.1f}")
+    cols[1].metric("Recovery", f"{int(metrics.get('recovery') or 0)}%")
+    cols[2].metric("Sleep", f"{int(metrics.get('sleep_performance') or 0)}%")
+
+    extra = st.columns(3)
+    extra[0].metric("Hours Slept", f"{float(metrics.get('sleep_hours') or 0):.1f} h")
+    extra[1].metric("HRV", f"{float(metrics.get('hrv_rmssd_milli') or 0):.1f}")
+    extra[2].metric("RHR", f"{int(metrics.get('resting_heart_rate') or 0)} bpm")
+
+
 def render_dashboard() -> None:
     st.title("Whoop Meal AI")
     st.caption("Recovery-aware meal guidance from food logs and wearable context.")
@@ -141,6 +184,8 @@ def render_dashboard() -> None:
         protein_g = st.number_input("Protein (g)", min_value=0.0, value=160.0, step=5.0)
         carbs_g = st.number_input("Carbs (g)", min_value=0.0, value=180.0, step=5.0)
         fat_g = st.number_input("Fat (g)", min_value=0.0, value=70.0, step=5.0)
+        insulin_resistant = st.checkbox("Insulin resistant", value=False)
+        include_whoop = st.checkbox("Use WHOOP context when available", value=True)
 
     st.subheader("Upload NetDiary CSV")
     uploaded = st.file_uploader("Choose a NetDiary export", type=["csv"])
@@ -160,6 +205,8 @@ def render_dashboard() -> None:
             st.success(f"Imported {inserted} rows for {day_detected or target_day.isoformat()}.")
 
     day_str = target_day.isoformat()
+    render_whoop_day_overview(day_str)
+
     consumed = load_day_summary(day_str)
     goals = {
         "calories": calories,
@@ -168,7 +215,30 @@ def render_dashboard() -> None:
         "fat_g": fat_g,
     }
     remaining = {key: max(goals[key] - consumed[key], 0.0) for key in goals}
-    next_meal = next_meal_target(consumed, goals)
+
+    recommendation = None
+    recommendation_error = None
+    try:
+        recommendation = fetch_api_json(
+            "/recommendation/day",
+            {
+                "day": day_str,
+                "calories": calories,
+                "protein_g": protein_g,
+                "carbs_g": carbs_g,
+                "fat_g": fat_g,
+                "insulin_resistant": str(insulin_resistant).lower(),
+                "include_whoop": str(include_whoop).lower(),
+            },
+        )
+    except RuntimeError as exc:
+        recommendation_error = str(exc)
+
+    next_meal = (
+        recommendation.get("next_meal_target")
+        if isinstance(recommendation, dict) and recommendation.get("next_meal_target")
+        else next_meal_target(consumed, goals)
+    )
 
     st.subheader("Daily Summary")
     top = st.columns(4)
@@ -184,10 +254,29 @@ def render_dashboard() -> None:
     meal_cols[2].metric("Carbs", f"{next_meal['carbs_g']:.0f} g")
     meal_cols[3].metric("Fat", f"{next_meal['fat_g']:.0f} g")
 
-    st.info(
-        "This first UI uses your current rule-based recommender. "
-        "WHOOP-aware meal logic is the next layer we can plug in."
-    )
+    if recommendation_error:
+        st.warning(
+            "The backend recommendation endpoint could not be reached, "
+            "so the UI is showing the local fallback recommendation.\n\n"
+            f"{recommendation_error}"
+        )
+
+    if recommendation:
+        st.subheader("Why This Meal")
+        for reason in recommendation.get("reasons", []):
+            st.write(f"- {reason}")
+
+        whoop_context = recommendation.get("whoop_context") or {}
+        if any(value is not None for value in whoop_context.values()):
+            st.subheader("WHOOP Context Used")
+            whoop_cols = st.columns(4)
+            whoop_cols[0].metric("Recovery", f"{whoop_context.get('recovery_score') or 0}%")
+            whoop_cols[1].metric("HRV", f"{whoop_context.get('hrv_rmssd_milli') or 0}")
+            whoop_cols[2].metric("RHR", f"{whoop_context.get('resting_heart_rate') or 0} bpm")
+            whoop_cols[3].metric("Strain", f"{whoop_context.get('cycle_strain') or 0}")
+
+        if recommendation.get("whoop_warning"):
+            st.info(f"WHOOP note: {recommendation['whoop_warning']}")
 
     render_whoop_status()
 
