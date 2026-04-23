@@ -10,7 +10,7 @@ from urllib.request import urlopen
 import streamlit as st
 
 from db import get_conn, get_import_status, init_db
-from food_import import parse_netdiary_csv
+from food_import import parse_netdiary_csv, parse_netdiary_summary_pdf
 from recommender import next_meal_target
 
 
@@ -575,17 +575,26 @@ def render_dashboard() -> None:
         insulin_resistant = st.checkbox("Insulin resistant", value=False)
         include_whoop = st.checkbox("Use WHOOP context when available", value=True)
 
-    st.subheader("Upload NetDiary CSV")
-    uploaded = st.file_uploader("Choose a NetDiary export", type=["csv"])
+    st.subheader("Upload MyNetDiary Report")
+    uploaded = st.file_uploader("Choose a MyNetDiary CSV or daily PDF", type=["csv", "pdf"])
     override_day = st.checkbox("Override imported day with selected day", value=False)
 
     if uploaded is not None and st.button("Import Food Log"):
         raw = uploaded.read()
         try:
-            rows, day_detected = parse_netdiary_csv(
-                raw,
-                day_override=target_day.isoformat() if override_day else None,
-            )
+            if (uploaded.name or "").lower().endswith(".pdf"):
+                rows, day_detected = parse_netdiary_summary_pdf(
+                    raw,
+                    filename=uploaded.name,
+                )
+                if override_day:
+                    for row in rows:
+                        row["day"] = target_day.isoformat()
+            else:
+                rows, day_detected = parse_netdiary_csv(
+                    raw,
+                    day_override=target_day.isoformat() if override_day else None,
+                )
             inserted = insert_food_rows(rows)
         except Exception as exc:
             st.error(f"Import failed: {exc}")
