@@ -1,5 +1,6 @@
 fastapi
 pandas
+pypdf
 pydantic
 python-multipart
 streamlit
