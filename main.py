@@ -4,24 +4,31 @@ import json
 import os
 import secrets
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from db import get_conn, get_whoop_tokens, init_db, save_whoop_tokens
+from db import (
+    delete_whoop_oauth_state,
+    get_conn,
+    get_whoop_tokens,
+    init_db,
+    save_whoop_oauth_state,
+    save_whoop_tokens,
+)
 from food_import import parse_netdiary_csv
-from recommender import next_meal_target, recommend_next_meal
+from recommender import build_daily_brief, next_meal_target, recommend_next_meal
 from whoop_client import WhoopClient, WhoopClientError
 
 
 WHOOP_AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 WHOOP_TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 WHOOP_DEFAULT_SCOPES = (
-    "offline "
     "read:recovery "
     "read:cycles "
     "read:workout "
@@ -69,7 +76,7 @@ def _load_whoop_snapshot(day: str) -> tuple[Optional[dict], Optional[str]]:
         snapshot = client.get_daily_snapshot(day)
         return snapshot.model_dump(), None
     except HTTPException as exc:
-        if exc.status_code == 400:
+        if exc.status_code in (400, 401):
             return None, exc.detail
         raise
     except WhoopClientError as exc:
@@ -102,7 +109,6 @@ def _summarize_whoop_day(snapshot: dict) -> dict:
 async def lifespan(app: FastAPI):
     # Startup
     init_db()
-    app.state.oauth_states = set()
     print("Database initialized")
     yield
     # Shutdown (nothing to clean up for sqlite here)
@@ -161,14 +167,33 @@ def _exchange_whoop_code_for_tokens(
         WHOOP_TOKEN_URL,
         data=body,
         method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            # WHOOP's edge occasionally rejects bare default urllib signatures.
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        },
     )
 
     try:
         with urlopen(request, timeout=20) as response:
             payload = response.read().decode("utf-8")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"WHOOP token exchange failed: {exc}")
+        detail = str(exc)
+        body = ""
+        if hasattr(exc, "read"):
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+        message = f"WHOOP token exchange failed: {detail}"
+        if body:
+            message = f"{message} | response: {body}"
+        raise HTTPException(status_code=502, detail=message)
 
     try:
         return json.loads(payload)
@@ -176,11 +201,99 @@ def _exchange_whoop_code_for_tokens(
         raise HTTPException(status_code=502, detail="WHOOP returned invalid token JSON") from exc
 
 
+def _refresh_whoop_tokens(*, refresh_token: str, client_id: str, client_secret: str) -> dict:
+    body = urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+    ).encode("utf-8")
+
+    request = Request(
+        WHOOP_TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = response.read().decode("utf-8")
+    except Exception as exc:
+        detail = str(exc)
+        body = ""
+        if hasattr(exc, "read"):
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+        message = f"WHOOP token refresh failed: {detail}"
+        if body:
+            message = f"{message} | response: {body}"
+        raise HTTPException(status_code=502, detail=message)
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="WHOOP returned invalid refresh JSON") from exc
+
+
+def _token_expires_at(token_row: dict) -> Optional[datetime]:
+    created_at = token_row.get("created_at")
+    expires_in = token_row.get("expires_in")
+    if not created_at or not expires_in:
+        return None
+    try:
+        created = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return created + timedelta(seconds=int(expires_in))
+    except Exception:
+        return None
+
+
 def _whoop_client_from_storage() -> WhoopClient:
     token_row = get_whoop_tokens()
     access_token = None
     if token_row:
-        access_token = token_row.get("access_token")
+        expires_at = _token_expires_at(token_row)
+        if expires_at and datetime.now(timezone.utc) >= expires_at:
+            refresh_token = token_row.get("refresh_token")
+            if refresh_token:
+                config = _whoop_config()
+                refreshed = _refresh_whoop_tokens(
+                    refresh_token=refresh_token,
+                    client_id=config["client_id"],
+                    client_secret=config["client_secret"],
+                )
+                access_token = refreshed.get("access_token")
+                if access_token:
+                    save_whoop_tokens(
+                        access_token=access_token,
+                        refresh_token=refreshed.get("refresh_token") or refresh_token,
+                        expires_in=refreshed.get("expires_in"),
+                        scope=refreshed.get("scope"),
+                        token_type=refreshed.get("token_type"),
+                    )
+            else:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "Stored WHOOP token has expired and no refresh token is available. "
+                        "Reconnect via /whoop/connect."
+                    ),
+                )
+
+        if not access_token:
+            access_token = token_row.get("access_token")
     if not access_token:
         access_token = os.getenv("WHOOP_ACCESS_TOKEN", "").strip()
     if not access_token:
@@ -194,8 +307,8 @@ def _whoop_client_from_storage() -> WhoopClient:
 @app.get("/whoop/login")
 def whoop_login():
     config = _whoop_config()
-    state = secrets.token_urlsafe(12)[:12]
-    app.state.oauth_states.add(state)
+    state = secrets.token_urlsafe(8)[:8]
+    save_whoop_oauth_state(state)
 
     query = urlencode(
         {
@@ -216,6 +329,12 @@ def whoop_login():
     }
 
 
+@app.get("/whoop/connect")
+def whoop_connect():
+    payload = whoop_login()
+    return RedirectResponse(url=payload["authorization_url"], status_code=307)
+
+
 @app.get("/whoop/callback")
 def whoop_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     if error:
@@ -224,10 +343,8 @@ def whoop_callback(code: Optional[str] = None, state: Optional[str] = None, erro
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing required WHOOP callback parameters.")
 
-    if state not in app.state.oauth_states:
+    if not delete_whoop_oauth_state(state):
         raise HTTPException(status_code=400, detail="Invalid OAuth state.")
-
-    app.state.oauth_states.discard(state)
     config = _whoop_config()
     tokens = _exchange_whoop_code_for_tokens(
         code=code,
@@ -261,6 +378,8 @@ def whoop_callback(code: Optional[str] = None, state: Optional[str] = None, erro
 @app.get("/whoop/status")
 def whoop_status():
     token_row = get_whoop_tokens()
+    expires_at = _token_expires_at(token_row) if token_row else None
+    expired = bool(expires_at and datetime.now(timezone.utc) >= expires_at)
     return {
         "configured": all(
             [
@@ -270,10 +389,15 @@ def whoop_status():
             ]
         ),
         "connected": token_row is not None,
+        "expired": expired,
+        "reauthorize_required": bool(token_row and expired and not token_row.get("refresh_token")),
         "token": {
             "scope": token_row["scope"],
             "token_type": token_row["token_type"],
             "created_at": token_row["created_at"],
+            "expires_in": token_row["expires_in"],
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "has_refresh_token": bool(token_row.get("refresh_token")),
         }
         if token_row
         else None,
@@ -446,5 +570,50 @@ def recommendation_day(
         "whoop_snapshot_available": whoop_snapshot is not None,
         "whoop_warning": whoop_warning,
         **recommendation,
+    }
+
+
+@app.get("/brief/day")
+def brief_day(
+    day: str = Query(..., description="YYYY-MM-DD"),
+    calories: float = Query(2000, ge=0),
+    protein_g: float = Query(160, ge=0),
+    carbs_g: float = Query(180, ge=0),
+    fat_g: float = Query(70, ge=0),
+    insulin_resistant: bool = Query(False),
+    include_whoop: bool = Query(True),
+):
+    consumed_today = _load_day_consumed(day)
+    goals = {
+        "calories": calories,
+        "protein_g": protein_g,
+        "carbs_g": carbs_g,
+        "fat_g": fat_g,
+    }
+
+    whoop_snapshot = None
+    whoop_warning = None
+    if include_whoop:
+        whoop_snapshot, whoop_warning = _load_whoop_snapshot(day)
+
+    try:
+        previous_day = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Day must be YYYY-MM-DD.")
+
+    yesterday_consumed = _load_day_consumed(previous_day)
+    brief = build_daily_brief(
+        day=day,
+        consumed_today=consumed_today,
+        goals=goals,
+        yesterday_consumed=yesterday_consumed,
+        whoop_snapshot=whoop_snapshot,
+        insulin_resistant=insulin_resistant,
+    )
+
+    return {
+        "whoop_snapshot_available": whoop_snapshot is not None,
+        "whoop_warning": whoop_warning,
+        **brief,
     }
 

@@ -12,6 +12,11 @@ from pydantic import BaseModel, Field
 
 
 DEFAULT_BASE_URL = "https://api.prod.whoop.com/developer/v2"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 class WhoopClientError(Exception):
@@ -194,6 +199,8 @@ class WhoopClient:
             headers={
                 "Authorization": f"Bearer {self.access_token}",
                 "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": DEFAULT_USER_AGENT,
             },
         )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 
 def _f(x) -> float:
     try:
@@ -153,4 +155,146 @@ def recommend_next_meal(
         "remaining": {k: round(v, 1) for k, v in remaining.items()},
         "whoop_context": whoop_context,
         "reasons": reasons,
+    }
+
+
+def _previous_day_iso(day_value: str) -> str | None:
+    try:
+        return (date.fromisoformat(day_value) - timedelta(days=1)).isoformat()
+    except ValueError:
+        return None
+
+
+def build_daily_brief(
+    *,
+    day: str,
+    consumed_today: dict,
+    goals: dict,
+    yesterday_consumed: dict | None = None,
+    whoop_snapshot: dict | None = None,
+    insulin_resistant: bool = False,
+) -> dict:
+    yesterday_consumed = yesterday_consumed or {}
+    recovery_score = _f(_get_nested(whoop_snapshot, "recovery", "score", "recovery_score"))
+    hrv = _f(_get_nested(whoop_snapshot, "recovery", "score", "hrv_rmssd_milli"))
+    rhr = _f(_get_nested(whoop_snapshot, "recovery", "score", "resting_heart_rate"))
+    cycle_strain = _f(_get_nested(whoop_snapshot, "cycle", "score", "strain"))
+    sleep_hours = (
+        _f(_get_nested(whoop_snapshot, "sleep", "score", "stage_summary", "total_light_sleep_time_milli"))
+        + _f(_get_nested(whoop_snapshot, "sleep", "score", "stage_summary", "total_slow_wave_sleep_time_milli"))
+        + _f(_get_nested(whoop_snapshot, "sleep", "score", "stage_summary", "total_rem_sleep_time_milli"))
+    ) / 3600000.0
+    sleep_performance = _f(_get_nested(whoop_snapshot, "sleep", "score", "sleep_performance_percentage"))
+
+    yesterday_calories = _f(yesterday_consumed.get("calories"))
+    yesterday_protein = _f(yesterday_consumed.get("protein_g"))
+    yesterday_carbs = _f(yesterday_consumed.get("carbs_g"))
+    yesterday_fat = _f(yesterday_consumed.get("fat_g"))
+
+    adjusted_goals = {
+        "calories": _f(goals.get("calories")),
+        "protein_g": max(_f(goals.get("protein_g")), 160.0),
+        "carbs_g": _f(goals.get("carbs_g")),
+        "fat_g": _f(goals.get("fat_g")),
+    }
+
+    training_focus = "Normal training day"
+    day_type = "balanced"
+    if recovery_score >= 67:
+        training_focus = "Performance-supportive day: lift, build, or push volume if desired."
+        day_type = "performance"
+        adjusted_goals["calories"] += 100.0
+        adjusted_goals["carbs_g"] += 20.0
+    elif 0 < recovery_score < 40:
+        training_focus = "Recovery-first day: walking, mobility, zone 2, and lower systemic stress."
+        day_type = "recovery"
+        adjusted_goals["calories"] = max(adjusted_goals["calories"] - 150.0, 1600.0)
+        adjusted_goals["fat_g"] = min(adjusted_goals["fat_g"], 60.0)
+    else:
+        training_focus = "Controlled-performance day: productive work is fine, but avoid max-effort training."
+
+    if insulin_resistant:
+        adjusted_goals["carbs_g"] = min(adjusted_goals["carbs_g"], 130.0)
+        adjusted_goals["fat_g"] = min(adjusted_goals["fat_g"], 70.0)
+
+    if yesterday_fat >= 90:
+        adjusted_goals["fat_g"] = min(adjusted_goals["fat_g"], 60.0)
+    if yesterday_protein < 120:
+        adjusted_goals["protein_g"] = max(adjusted_goals["protein_g"], 170.0)
+    if yesterday_calories > adjusted_goals["calories"] + 150:
+        adjusted_goals["calories"] = max(adjusted_goals["calories"] - 100.0, 1700.0)
+
+    recommendation = recommend_next_meal(
+        consumed_today,
+        adjusted_goals,
+        whoop_snapshot=whoop_snapshot,
+        insulin_resistant=insulin_resistant,
+    )
+
+    observations: list[str] = []
+    if sleep_hours:
+        observations.append(f"Sleep delivered {sleep_hours:.1f} h with {sleep_performance:.0f}% sleep performance.")
+    if recovery_score:
+        observations.append(f"WHOOP recovery is {recovery_score:.0f}% with HRV {hrv:.1f} and resting HR {rhr:.0f}.")
+    if yesterday_calories:
+        observations.append(
+            f"Yesterday landed at {yesterday_calories:.0f} kcal with {yesterday_protein:.0f}g protein, "
+            f"{yesterday_carbs:.0f}g carbs, and {yesterday_fat:.0f}g fat."
+        )
+    if insulin_resistant:
+        observations.append("Insulin resistance mode is on, so carbs stay controlled and meals should be fiber-forward.")
+
+    priorities: list[str] = []
+    if recovery_score >= 67:
+        priorities.append("Front-load protein early and place most carbs around training or mid-day activity.")
+    elif recovery_score > 0:
+        priorities.append("Keep breakfast protein-heavy and avoid a very high-fat first meal.")
+    if yesterday_fat >= 90:
+        priorities.append("Yesterday was fat-heavy, so keep fats tighter today and use leaner protein sources.")
+    if cycle_strain < 6:
+        priorities.append("Current strain is still low, so let movement quality set the tone before adding intensity.")
+    else:
+        priorities.append("Use today's existing strain to decide whether you need more fuel before another hard session.")
+
+    breakfast = {
+        "calories": min(max(recommendation["next_meal_target"]["calories"], 300.0), 550.0),
+        "protein_g": min(max(recommendation["next_meal_target"]["protein_g"], 35.0), 45.0),
+        "carbs_g": recommendation["next_meal_target"]["carbs_g"],
+        "fat_g": recommendation["next_meal_target"]["fat_g"],
+    }
+
+    breakfast_strategy = (
+        "High protein breakfast, controlled carbs, and lighter fats to stabilize energy and support recovery."
+        if insulin_resistant or recovery_score < 67
+        else "Protein-forward breakfast with strategic carbs to support a stronger performance day."
+    )
+
+    recovery_focus = (
+        "Hydrate early, get sunlight, and use a lighter training load while recovery builds."
+        if recovery_score < 67
+        else "Hydrate, train with intent, and use meals to reinforce performance instead of chasing calories late."
+    )
+
+    return {
+        "day": day,
+        "previous_day": _previous_day_iso(day),
+        "day_type": day_type,
+        "today_consumed": {k: round(_f(v), 1) for k, v in consumed_today.items()},
+        "yesterday_consumed": {k: round(_f(v), 1) for k, v in yesterday_consumed.items()},
+        "adjusted_goals": {k: round(_f(v), 1) for k, v in adjusted_goals.items()},
+        "whoop_context": {
+            "recovery_score": round(recovery_score, 1) if recovery_score else None,
+            "sleep_hours": round(sleep_hours, 2) if sleep_hours else None,
+            "sleep_performance": round(sleep_performance, 1) if sleep_performance else None,
+            "hrv_rmssd_milli": round(hrv, 1) if hrv else None,
+            "resting_heart_rate": round(rhr, 1) if rhr else None,
+            "cycle_strain": round(cycle_strain, 1) if cycle_strain else None,
+        },
+        "training_focus": training_focus,
+        "recovery_focus": recovery_focus,
+        "breakfast_strategy": breakfast_strategy,
+        "breakfast_target": breakfast,
+        "next_meal_target": recommendation["next_meal_target"],
+        "observations": observations,
+        "priorities": priorities,
     }

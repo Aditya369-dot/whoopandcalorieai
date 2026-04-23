@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: whoopmealai-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.7
+      - key: WHOOP_REDIRECT_URI
+        sync: false
+      - key: WHOOP_CLIENT_ID
+        sync: false
+      - key: WHOOP_CLIENT_SECRET
+        sync: false
+      - key: WHOOP_SCOPE
+        value: read:recovery read:cycles read:workout read:sleep read:profile read:body_measurement
+
+  - type: web
+    name: whoopmealai-app
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.7
+      - key: API_BASE_URL
+        sync: false
