@@ -43,6 +43,13 @@ class ImportResponse(BaseModel):
     day_detected: str
 
 
+class ImportRowsRequest(BaseModel):
+    rows: list[dict]
+    day: str
+    source_kind: Optional[str] = None
+    source_path: Optional[str] = None
+
+
 def _load_day_consumed(day: str) -> dict:
     conn = get_conn()
     cur = conn.cursor()
@@ -495,6 +502,62 @@ async def import_netdiary(
     conn.close()
 
     return {"inserted_rows": inserted, "day_detected": day_detected or (day or "")}
+
+
+@app.post("/import/netdiary/rows", response_model=ImportResponse)
+def import_netdiary_rows(payload: ImportRowsRequest):
+    if not payload.rows:
+        raise HTTPException(status_code=400, detail="No parsed rows were provided.")
+
+    target_day = payload.day
+    normalized_rows = []
+    for row in payload.rows:
+        next_row = dict(row)
+        next_row["day"] = target_day
+        next_row["source"] = "netdiary_manual"
+        normalized_rows.append(next_row)
+
+    inserted = 0
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM food_logs WHERE day=? AND source=?", (target_day, "netdiary_manual"))
+    for row in normalized_rows:
+        cur.execute(
+            """
+            INSERT INTO food_logs (source, eaten_at, day, item_name, calories, protein_g, carbs_g, fat_g)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row.get("source", "netdiary_manual"),
+                row.get("eaten_at"),
+                row.get("day"),
+                row.get("item_name"),
+                row.get("calories"),
+                row.get("protein_g"),
+                row.get("carbs_g"),
+                row.get("fat_g"),
+            ),
+        )
+        inserted += 1
+    conn.commit()
+    conn.close()
+
+    from db import save_import_status
+
+    save_import_status(
+        import_name="mynetdiary_auto",
+        status="success",
+        target_day=target_day,
+        detected_day=target_day,
+        source_path=payload.source_path or "manual_upload",
+        source_kind=payload.source_kind or "upload",
+        rows_found=len(normalized_rows),
+        rows_inserted=inserted,
+        message="Imported MyNetDiary data from Streamlit upload.",
+        succeeded=True,
+    )
+
+    return {"inserted_rows": inserted, "day_detected": target_day}
 
 
 @app.get("/summary/day")

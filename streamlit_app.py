@@ -1,74 +1,21 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 import os
 from typing import Dict
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import streamlit as st
 
-from db import get_conn, get_import_status, init_db
+from db import get_import_status, init_db
 from food_import import parse_netdiary_csv, parse_netdiary_summary_pdf
 from recommender import next_meal_target
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-
-
-def load_day_summary(day: str) -> Dict[str, float]:
-    conn = get_conn()
-    cur = conn.cursor()
-    row = cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(calories), 0),
-            COALESCE(SUM(protein_g), 0),
-            COALESCE(SUM(carbs_g), 0),
-            COALESCE(SUM(fat_g), 0)
-        FROM food_logs
-        WHERE day=?
-        """,
-        (day,),
-    ).fetchone()
-    conn.close()
-
-    return {
-        "calories": float(row[0] or 0),
-        "protein_g": float(row[1] or 0),
-        "carbs_g": float(row[2] or 0),
-        "fat_g": float(row[3] or 0),
-    }
-
-
-def insert_food_rows(rows: list[dict]) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    inserted = 0
-    for row in rows:
-        cur.execute(
-            """
-            INSERT INTO food_logs (source, eaten_at, day, item_name, calories, protein_g, carbs_g, fat_g)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                row.get("source", "netdiary"),
-                row.get("eaten_at"),
-                row.get("day"),
-                row.get("item_name"),
-                row.get("calories"),
-                row.get("protein_g"),
-                row.get("carbs_g"),
-                row.get("fat_g"),
-            ),
-        )
-        inserted += 1
-
-    conn.commit()
-    conn.close()
-    return inserted
 
 
 def fetch_api_json(path: str, query: dict | None = None) -> dict:
@@ -79,6 +26,26 @@ def fetch_api_json(path: str, query: dict | None = None) -> dict:
     try:
         with urlopen(url, timeout=20) as response:
             return __import__("json").loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"API error {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Unable to reach backend API: {exc.reason}") from exc
+
+
+def post_api_json(path: str, payload: dict) -> dict:
+    url = f"{API_BASE_URL}{path}"
+    body = json.dumps(payload).encode("utf-8")
+    request = Request(
+        url=url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"API error {exc.code}: {detail}") from exc
@@ -595,7 +562,17 @@ def render_dashboard() -> None:
                     raw,
                     day_override=target_day.isoformat() if override_day else None,
                 )
-            inserted = insert_food_rows(rows)
+            import_result = post_api_json(
+                "/import/netdiary/rows",
+                {
+                    "rows": rows,
+                    "day": target_day.isoformat() if override_day else day_detected,
+                    "source_kind": "pdf" if (uploaded.name or "").lower().endswith(".pdf") else "csv",
+                    "source_path": uploaded.name or "streamlit_upload",
+                },
+            )
+            inserted = int(import_result.get("inserted_rows") or 0)
+            day_detected = import_result.get("day_detected") or day_detected
         except Exception as exc:
             st.error(f"Import failed: {exc}")
         else:
@@ -614,7 +591,22 @@ def render_dashboard() -> None:
     )
     render_whoop_day_overview(day_str)
 
-    consumed = load_day_summary(day_str)
+    summary_payload = fetch_api_json(
+        "/summary/day",
+        {
+            "day": day_str,
+            "calories": calories,
+            "protein_g": protein_g,
+            "carbs_g": carbs_g,
+            "fat_g": fat_g,
+        },
+    )
+    consumed = summary_payload.get("consumed") or {
+        "calories": 0.0,
+        "protein_g": 0.0,
+        "carbs_g": 0.0,
+        "fat_g": 0.0,
+    }
     goals = {
         "calories": calories,
         "protein_g": protein_g,
