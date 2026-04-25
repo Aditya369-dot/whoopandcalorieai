@@ -410,6 +410,17 @@ def resolve_nutrition_context_day(day_str: str) -> tuple[str, str]:
     return expected_day, "No imported nutrition day is available yet."
 
 
+def get_latest_imported_nutrition_day() -> str | None:
+    try:
+        payload = fetch_api_json("/import/status", {"name": "mynetdiary_auto"})
+    except RuntimeError:
+        return None
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if not status:
+        return None
+    return status.get("target_day")
+
+
 def render_morning_brief(
     day_str: str,
     *,
@@ -665,6 +676,33 @@ def render_dashboard() -> None:
         top[2].metric("Carbs", f"{consumed['carbs_g']:.0f} g", f"{remaining['carbs_g']:.0f} g left")
         top[3].metric("Fat", f"{consumed['fat_g']:.0f} g", f"{remaining['fat_g']:.0f} g left")
         render_macro_donut_chart(consumed, goals)
+
+    latest_imported_day = get_latest_imported_nutrition_day()
+    if latest_imported_day and latest_imported_day != nutrition_day:
+        latest_payload = fetch_api_json(
+            "/summary/day",
+            {
+                "day": latest_imported_day,
+                "calories": calories,
+                "protein_g": protein_g,
+                "carbs_g": carbs_g,
+                "fat_g": fat_g,
+            },
+        )
+        latest_consumed = latest_payload.get("consumed") or {
+            "calories": 0.0,
+            "protein_g": 0.0,
+            "carbs_g": 0.0,
+            "fat_g": 0.0,
+        }
+        st.subheader("Last Imported Nutrition Day")
+        st.caption(f"This visual always shows the latest uploaded nutrition file: {latest_imported_day}")
+        latest_top = st.columns(4)
+        latest_top[0].metric("Calories", f"{latest_consumed['calories']:.0f}")
+        latest_top[1].metric("Protein", f"{latest_consumed['protein_g']:.0f} g")
+        latest_top[2].metric("Carbs", f"{latest_consumed['carbs_g']:.0f} g")
+        latest_top[3].metric("Fat", f"{latest_consumed['fat_g']:.0f} g")
+        render_macro_donut_chart(latest_consumed, goals)
 
     st.subheader("Next Meal Target")
     meal_cols = st.columns(4)
