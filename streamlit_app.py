@@ -104,6 +104,115 @@ def render_stat_card(label: str, value: str, detail: str = "", accent: str = "#3
     )
 
 
+def render_macro_donut_chart(consumed: dict, goals: dict) -> None:
+    st.markdown("##### Macro Split")
+
+    protein = float(consumed.get("protein_g") or 0)
+    carbs = float(consumed.get("carbs_g") or 0)
+    fat = float(consumed.get("fat_g") or 0)
+    total = protein + carbs + fat
+
+    if total <= 0:
+        st.info("Import a food log to see the macro split for this day.")
+        return
+
+    protein_pct = (protein / total) * 100.0
+    carbs_pct = (carbs / total) * 100.0
+    fat_pct = (fat / total) * 100.0
+    carbs_end = protein_pct + carbs_pct
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown(
+            f"""
+            <div style="
+                background:linear-gradient(180deg, #0f172a 0%, #111827 100%);
+                border:1px solid #1f2937;
+                border-radius:24px;
+                padding:24px 16px 20px 16px;
+                text-align:center;
+                box-shadow: inset 0 -10px 20px rgba(0,0,0,0.22);
+            ">
+                <div style="
+                    width:210px;
+                    height:210px;
+                    margin:0 auto;
+                    border-radius:50%;
+                    background:
+                        radial-gradient(circle at 50% 35%, rgba(255,255,255,0.18), transparent 28%),
+                        radial-gradient(circle at 50% 50%, #0f172a 42%, transparent 43%),
+                        conic-gradient(
+                            #22c55e 0% {protein_pct:.2f}%,
+                            #38bdf8 {protein_pct:.2f}% {carbs_end:.2f}%,
+                            #f97316 {carbs_end:.2f}% 100%
+                        );
+                    box-shadow:
+                        inset 0 -14px 20px rgba(0,0,0,0.28),
+                        0 16px 28px rgba(0,0,0,0.25);
+                    position:relative;
+                ">
+                    <div style="
+                        position:absolute;
+                        inset:39px;
+                        border-radius:50%;
+                        background:linear-gradient(180deg, #0b1220 0%, #111827 100%);
+                        display:flex;
+                        align-items:center;
+                        justify-content:center;
+                        flex-direction:column;
+                        color:white;
+                        box-shadow: inset 0 8px 18px rgba(255,255,255,0.04);
+                    ">
+                        <div style="font-size:0.8rem;letter-spacing:0.08em;text-transform:uppercase;color:#94a3b8;">Consumed</div>
+                        <div style="font-size:2.1rem;font-weight:700;line-height:1.0;">{int(total)}g</div>
+                        <div style="font-size:0.9rem;color:#94a3b8;margin-top:4px;">Macros today</div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        render_stat_card(
+            "Protein",
+            f"{protein:.0f} g",
+            f"{protein_pct:.0f}% of total | goal {float(goals.get('protein_g') or 0):.0f} g",
+            "#22c55e",
+        )
+        render_stat_card(
+            "Carbs",
+            f"{carbs:.0f} g",
+            f"{carbs_pct:.0f}% of total | goal {float(goals.get('carbs_g') or 0):.0f} g",
+            "#38bdf8",
+        )
+        render_stat_card(
+            "Fat",
+            f"{fat:.0f} g",
+            f"{fat_pct:.0f}% of total | goal {float(goals.get('fat_g') or 0):.0f} g",
+            "#f97316",
+        )
+
+
+def render_top_whoop_strip(day_str: str) -> None:
+    try:
+        payload = fetch_api_json("/whoop/day", {"day": day_str})
+    except RuntimeError:
+        return
+
+    metrics = payload.get("metrics") or {}
+    cols = st.columns(5)
+    with cols[0]:
+        render_stat_card("Recovery", f"{int(float(metrics.get('recovery') or 0))}%", "Daily readiness", "#22c55e")
+    with cols[1]:
+        render_stat_card("Sleep", f"{int(float(metrics.get('sleep_performance') or 0))}%", "Sleep performance", "#38bdf8")
+    with cols[2]:
+        render_stat_card("Strain", f"{float(metrics.get('strain') or 0):.1f}", "Current day strain", "#f97316")
+    with cols[3]:
+        render_stat_card("HRV", f"{float(metrics.get('hrv_rmssd_milli') or 0):.1f}", "RMSSD", "#a78bfa")
+    with cols[4]:
+        render_stat_card("RHR", f"{int(float(metrics.get('resting_heart_rate') or 0))} bpm", "Resting heart rate", "#ef4444")
+
+
 def render_section_banner(title: str, subtitle: str, accent: str) -> None:
     st.markdown(
         f"""
@@ -541,10 +650,10 @@ def render_dashboard() -> None:
         fat_g = st.number_input("Fat (g)", min_value=0.0, value=70.0, step=5.0)
         insulin_resistant = st.checkbox("Insulin resistant", value=False)
         include_whoop = st.checkbox("Use WHOOP context when available", value=True)
-
-    st.subheader("Upload MyNetDiary Report")
-    uploaded = st.file_uploader("Choose a MyNetDiary CSV or daily PDF", type=["csv", "pdf"])
-    override_day = st.checkbox("Override imported day with selected day", value=False)
+        st.divider()
+        st.subheader("Upload MyNetDiary Report")
+        uploaded = st.file_uploader("Choose a MyNetDiary CSV or daily PDF", type=["csv", "pdf"])
+        override_day = st.checkbox("Override imported day with selected day", value=False)
 
     if uploaded is not None and st.button("Import Food Log"):
         raw = uploaded.read()
@@ -579,6 +688,7 @@ def render_dashboard() -> None:
             st.success(f"Imported {inserted} rows for {day_detected or target_day.isoformat()}.")
 
     day_str = target_day.isoformat()
+    render_top_whoop_strip(day_str)
     render_import_status_panel(day_str)
     render_morning_brief(
         day_str,
@@ -645,6 +755,7 @@ def render_dashboard() -> None:
     top[1].metric("Protein", f"{consumed['protein_g']:.0f} g", f"{remaining['protein_g']:.0f} g left")
     top[2].metric("Carbs", f"{consumed['carbs_g']:.0f} g", f"{remaining['carbs_g']:.0f} g left")
     top[3].metric("Fat", f"{consumed['fat_g']:.0f} g", f"{remaining['fat_g']:.0f} g left")
+    render_macro_donut_chart(consumed, goals)
 
     st.subheader("Next Meal Target")
     meal_cols = st.columns(4)
