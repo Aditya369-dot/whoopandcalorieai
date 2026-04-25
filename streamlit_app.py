@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 
 import streamlit as st
 
-from db import get_import_status, init_db
+from db import init_db
 from food_import import parse_netdiary_csv, parse_netdiary_summary_pdf
 from recommender import next_meal_target
 
@@ -276,17 +276,17 @@ def render_whoop_status() -> None:
 
     if not status.get("configured"):
         st.info("WHOOP OAuth is not configured on the backend yet.")
-        st.markdown(f"[Open WHOOP Connect]({connect_url})")
+        st.link_button("Open WHOOP Connect", connect_url, type="primary", use_container_width=True)
         return
 
     if not status.get("connected"):
         st.info("WHOOP is configured, but no stored connection is available yet.")
-        st.markdown(f"[Connect WHOOP]({connect_url})")
+        st.link_button("Connect WHOOP", connect_url, type="primary", use_container_width=True)
         return
 
     if status.get("reauthorize_required") or status.get("expired"):
         st.warning("Your WHOOP session has expired. Reconnect to load live recovery and day metrics.")
-        st.markdown(f"[Reconnect WHOOP]({connect_url})")
+        st.link_button("Reconnect WHOOP", connect_url, type="primary", use_container_width=True)
         return
 
     profile = None
@@ -309,7 +309,7 @@ def render_whoop_status() -> None:
         f"Expires: {token.get('expires_at') or 'unknown'}"
     )
     st.caption("If WHOOP data stops loading later, use reconnect below to refresh the session.")
-    st.markdown(f"[Reconnect WHOOP]({connect_url})")
+    st.link_button("Reconnect WHOOP", connect_url, use_container_width=True)
 
     try:
         recovery = fetch_api_json("/whoop/recovery/current")
@@ -332,7 +332,13 @@ def render_import_status_panel(day_str: str) -> None:
     st.subheader("Nutrition Import Status")
     st.caption("This shows whether yesterday's intake was imported successfully for the current brief.")
 
-    status = get_import_status("mynetdiary_auto")
+    try:
+        payload = fetch_api_json("/import/status", {"name": "mynetdiary_auto"})
+    except RuntimeError as exc:
+        st.info(f"Nutrition import status is not available yet. {exc}")
+        return
+
+    status = payload.get("status") if isinstance(payload, dict) else None
     expected_day = (date.fromisoformat(day_str) if day_str else date.today()).replace()
     expected_day = expected_day.fromordinal(expected_day.toordinal() - 1).isoformat()
 
@@ -367,6 +373,38 @@ def render_import_status_panel(day_str: str) -> None:
     st.caption(f"Last succeeded: {succeeded}")
     if status.get("message"):
         st.caption(str(status["message"]))
+
+
+def resolve_nutrition_context_day(day_str: str) -> tuple[str, str]:
+    expected_day = (date.fromisoformat(day_str) - timedelta(days=1)).isoformat()
+    summary_payload = fetch_api_json(
+        "/summary/day",
+        {
+            "day": expected_day,
+            "calories": 0,
+            "protein_g": 0,
+            "carbs_g": 0,
+            "fat_g": 0,
+        },
+    )
+    consumed = summary_payload.get("consumed") or {}
+    has_expected_data = any(float(consumed.get(key) or 0) > 0 for key in ("calories", "protein_g", "carbs_g", "fat_g"))
+    if has_expected_data:
+        return expected_day, "Yesterday's nutrition is available and matched to today's WHOOP context."
+
+    try:
+        payload = fetch_api_json("/import/status", {"name": "mynetdiary_auto"})
+        status = payload.get("status") if isinstance(payload, dict) else None
+    except RuntimeError:
+        status = None
+
+    imported_day = (status or {}).get("target_day")
+    if imported_day:
+        return imported_day, (
+            f"Yesterday's nutrition is missing, so the chart is showing the latest imported nutrition day: {imported_day}."
+        )
+
+    return expected_day, "No imported nutrition day is available yet."
 
 
 def render_morning_brief(
@@ -472,6 +510,15 @@ def render_morning_brief(
 def render_dashboard() -> None:
     st.title("Whoop Meal AI")
     st.caption("Recovery-aware meal guidance from food logs and wearable context.")
+    try:
+        whoop_status = fetch_api_json("/whoop/status")
+    except RuntimeError:
+        whoop_status = {}
+
+    button_label = "Connect WHOOP"
+    if whoop_status.get("connected") or whoop_status.get("expired") or whoop_status.get("reauthorize_required"):
+        button_label = "Reconnect WHOOP"
+    st.link_button(button_label, f"{API_BASE_URL}/whoop/connect", type="primary", use_container_width=True)
 
     with st.sidebar:
         st.header("Daily Targets")
@@ -519,7 +566,7 @@ def render_dashboard() -> None:
             st.success(f"Imported {inserted} rows for {day_detected or target_day.isoformat()}.")
 
     day_str = target_day.isoformat()
-    nutrition_day = (target_day - timedelta(days=1)).isoformat()
+    nutrition_day, nutrition_context_note = resolve_nutrition_context_day(day_str)
     render_top_whoop_strip(day_str)
     render_import_status_panel(day_str)
     render_morning_brief(
@@ -580,8 +627,9 @@ def render_dashboard() -> None:
         else next_meal_target(consumed, goals)
     )
 
-    st.subheader("Yesterday's Nutrition Context")
-    st.caption(f"Using nutrition from {nutrition_day} to explain today's WHOOP readiness.")
+    st.subheader("Nutrition Context")
+    st.caption(f"WHOOP day: {day_str} | Nutrition day: {nutrition_day}")
+    st.caption(nutrition_context_note)
     top = st.columns(4)
     top[0].metric("Calories", f"{consumed['calories']:.0f}", f"{remaining['calories']:.0f} left")
     top[1].metric("Protein", f"{consumed['protein_g']:.0f} g", f"{remaining['protein_g']:.0f} g left")

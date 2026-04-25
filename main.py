@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from db import (
     delete_whoop_oauth_state,
     get_conn,
+    get_import_status,
     get_whoop_tokens,
     init_db,
     save_whoop_oauth_state,
@@ -558,6 +559,12 @@ def import_netdiary_rows(payload: ImportRowsRequest):
     )
 
     return {"inserted_rows": inserted, "day_detected": target_day}
+
+
+@app.get("/import/status")
+def import_status(name: str = Query("mynetdiary_auto")):
+    status = get_import_status(name)
+    return {"status": status}
 
 
 @app.get("/summary/day")
