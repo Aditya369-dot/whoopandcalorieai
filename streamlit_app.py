@@ -112,18 +112,23 @@ def render_stat_card(label: str, value: str, detail: str = "", accent: str = "#3
 def render_macro_donut_chart(consumed: dict, goals: dict) -> None:
     st.markdown("##### Macro Split")
 
-    protein = float(consumed.get("protein_g") or 0)
-    carbs = float(consumed.get("carbs_g") or 0)
-    fat = float(consumed.get("fat_g") or 0)
-    total = protein + carbs + fat
+    protein_g = float(consumed.get("protein_g") or 0)
+    carbs_g = float(consumed.get("carbs_g") or 0)
+    fat_g = float(consumed.get("fat_g") or 0)
 
-    if total <= 0:
+    protein_cals = protein_g * 4.0
+    carbs_cals = carbs_g * 4.0
+    fat_cals = fat_g * 9.0
+    macro_total_cals = protein_cals + carbs_cals + fat_cals
+    logged_total_cals = float(consumed.get("calories") or 0)
+
+    if macro_total_cals <= 0:
         st.info("Import a food log to see the macro split for this day.")
         return
 
-    protein_pct = (protein / total) * 100.0
-    carbs_pct = (carbs / total) * 100.0
-    fat_pct = (fat / total) * 100.0
+    protein_pct = (protein_cals / macro_total_cals) * 100.0
+    carbs_pct = (carbs_cals / macro_total_cals) * 100.0
+    fat_pct = (fat_cals / macro_total_cals) * 100.0
     carbs_end = protein_pct + carbs_pct
 
     left, right = st.columns([1, 1])
@@ -169,8 +174,8 @@ def render_macro_donut_chart(consumed: dict, goals: dict) -> None:
                         box-shadow: inset 0 8px 18px rgba(255,255,255,0.04);
                     ">
                         <div style="font-size:0.8rem;letter-spacing:0.08em;text-transform:uppercase;color:#94a3b8;">Consumed</div>
-                        <div style="font-size:2.1rem;font-weight:700;line-height:1.0;">{int(total)}g</div>
-                        <div style="font-size:0.9rem;color:#94a3b8;margin-top:4px;">Macros today</div>
+                        <div style="font-size:2.1rem;font-weight:700;line-height:1.0;">{int(logged_total_cals or macro_total_cals)}</div>
+                        <div style="font-size:0.9rem;color:#94a3b8;margin-top:4px;">Calories today</div>
                     </div>
                 </div>
             </div>
@@ -180,20 +185,20 @@ def render_macro_donut_chart(consumed: dict, goals: dict) -> None:
     with right:
         render_stat_card(
             "Protein",
-            f"{protein:.0f} g",
-            f"{protein_pct:.0f}% of total | goal {float(goals.get('protein_g') or 0):.0f} g",
+            f"{protein_g:.0f} g",
+            f"{protein_cals:.0f} kcal | {protein_pct:.0f}% of calories",
             "#22c55e",
         )
         render_stat_card(
             "Carbs",
-            f"{carbs:.0f} g",
-            f"{carbs_pct:.0f}% of total | goal {float(goals.get('carbs_g') or 0):.0f} g",
+            f"{carbs_g:.0f} g",
+            f"{carbs_cals:.0f} kcal | {carbs_pct:.0f}% of calories",
             "#38bdf8",
         )
         render_stat_card(
             "Fat",
-            f"{fat:.0f} g",
-            f"{fat_pct:.0f}% of total | goal {float(goals.get('fat_g') or 0):.0f} g",
+            f"{fat_g:.0f} g",
+            f"{fat_cals:.0f} kcal | {fat_pct:.0f}% of calories",
             "#f97316",
         )
 
