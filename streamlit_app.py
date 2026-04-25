@@ -12,10 +12,15 @@ import streamlit as st
 
 from db import init_db
 from food_import import parse_netdiary_csv, parse_netdiary_summary_pdf
+from lab_import import parse_lab_results_csv
 from recommender import next_meal_target
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_CALORIES = 2000.0
+DEFAULT_PROTEIN_G = 160.0
+DEFAULT_CARBS_G = 180.0
+DEFAULT_FAT_G = 70.0
 
 
 def fetch_api_json(path: str, query: dict | None = None) -> dict:
@@ -200,8 +205,7 @@ def render_top_whoop_strip(day_str: str) -> None:
         return
 
     metrics = payload.get("metrics") or {}
-    st.subheader("WHOOP Core Metrics")
-    st.caption("Today's core readiness signals from WHOOP.")
+    st.markdown("##### WHOOP Core Metrics")
     cols = st.columns(3)
     with cols[0]:
         render_gauge_card("Recovery", float(metrics.get("recovery") or 0), 100.0, "#22c55e", "%")
@@ -308,8 +312,7 @@ def render_whoop_status() -> None:
     meta_cols[2].caption(
         f"Expires: {token.get('expires_at') or 'unknown'}"
     )
-    st.caption("If WHOOP data stops loading later, use reconnect below to refresh the session.")
-    st.link_button("Reconnect WHOOP", connect_url, use_container_width=True)
+    st.caption("If WHOOP data stops loading later, reconnect from the top of the dashboard.")
 
     try:
         recovery = fetch_api_json("/whoop/recovery/current")
@@ -518,20 +521,21 @@ def render_dashboard() -> None:
     button_label = "Connect WHOOP"
     if whoop_status.get("connected") or whoop_status.get("expired") or whoop_status.get("reauthorize_required"):
         button_label = "Reconnect WHOOP"
-    st.link_button(button_label, f"{API_BASE_URL}/whoop/connect", type="primary", use_container_width=True)
+    top_button_col, _ = st.columns([1, 5])
+    with top_button_col:
+        st.link_button(button_label, f"{API_BASE_URL}/whoop/connect", type="primary")
 
     with st.sidebar:
-        st.header("Daily Targets")
+        st.header("Daily View")
         target_day = st.date_input("Day", value=date.today())
-        calories = st.number_input("Calories", min_value=0.0, value=2000.0, step=50.0)
-        protein_g = st.number_input("Protein (g)", min_value=0.0, value=160.0, step=5.0)
-        carbs_g = st.number_input("Carbs (g)", min_value=0.0, value=180.0, step=5.0)
-        fat_g = st.number_input("Fat (g)", min_value=0.0, value=70.0, step=5.0)
         include_whoop = st.checkbox("Use WHOOP context when available", value=True)
         st.divider()
         st.subheader("Upload MyNetDiary Report")
         uploaded = st.file_uploader("Choose a MyNetDiary CSV or daily PDF", type=["csv", "pdf"])
         override_day = st.checkbox("Override imported day with selected day", value=False)
+        st.divider()
+        st.subheader("Upload Lab Results")
+        lab_uploaded = st.file_uploader("Choose a lab CSV", type=["csv"], key="lab_upload")
 
     if uploaded is not None and st.button("Import Food Log"):
         raw = uploaded.read()
@@ -565,19 +569,32 @@ def render_dashboard() -> None:
         else:
             st.success(f"Imported {inserted} rows for {day_detected or target_day.isoformat()}.")
 
+    if lab_uploaded is not None and st.sidebar.button("Import Lab Results"):
+        raw = lab_uploaded.read()
+        try:
+            lab_rows = parse_lab_results_csv(raw, source_default="lab_upload")
+            lab_result = post_api_json(
+                "/import/labs/rows",
+                {
+                    "rows": lab_rows,
+                    "source_kind": "csv",
+                    "source_path": lab_uploaded.name or "lab_upload",
+                },
+            )
+            inserted = int(lab_result.get("inserted_rows") or 0)
+        except Exception as exc:
+            st.sidebar.error(f"Lab import failed: {exc}")
+        else:
+            st.sidebar.success(f"Imported {inserted} lab rows.")
+
     day_str = target_day.isoformat()
     nutrition_day, nutrition_context_note = resolve_nutrition_context_day(day_str)
+    calories = DEFAULT_CALORIES
+    protein_g = DEFAULT_PROTEIN_G
+    carbs_g = DEFAULT_CARBS_G
+    fat_g = DEFAULT_FAT_G
     render_top_whoop_strip(day_str)
     render_import_status_panel(day_str)
-    render_morning_brief(
-        day_str,
-        calories=calories,
-        protein_g=protein_g,
-        carbs_g=carbs_g,
-        fat_g=fat_g,
-        insulin_resistant=False,
-        include_whoop=include_whoop,
-    )
 
     summary_payload = fetch_api_json(
         "/summary/day",
@@ -627,15 +644,27 @@ def render_dashboard() -> None:
         else next_meal_target(consumed, goals)
     )
 
-    st.subheader("Nutrition Context")
-    st.caption(f"WHOOP day: {day_str} | Nutrition day: {nutrition_day}")
-    st.caption(nutrition_context_note)
-    top = st.columns(4)
-    top[0].metric("Calories", f"{consumed['calories']:.0f}", f"{remaining['calories']:.0f} left")
-    top[1].metric("Protein", f"{consumed['protein_g']:.0f} g", f"{remaining['protein_g']:.0f} g left")
-    top[2].metric("Carbs", f"{consumed['carbs_g']:.0f} g", f"{remaining['carbs_g']:.0f} g left")
-    top[3].metric("Fat", f"{consumed['fat_g']:.0f} g", f"{remaining['fat_g']:.0f} g left")
-    render_macro_donut_chart(consumed, goals)
+    top_left, top_right = st.columns([1.2, 1])
+    with top_left:
+        render_morning_brief(
+            day_str,
+            calories=calories,
+            protein_g=protein_g,
+            carbs_g=carbs_g,
+            fat_g=fat_g,
+            insulin_resistant=False,
+            include_whoop=include_whoop,
+        )
+    with top_right:
+        st.subheader("Nutrition Context")
+        st.caption(f"WHOOP day: {day_str} | Nutrition day: {nutrition_day}")
+        st.caption(nutrition_context_note)
+        top = st.columns(4)
+        top[0].metric("Calories", f"{consumed['calories']:.0f}", f"{remaining['calories']:.0f} left")
+        top[1].metric("Protein", f"{consumed['protein_g']:.0f} g", f"{remaining['protein_g']:.0f} g left")
+        top[2].metric("Carbs", f"{consumed['carbs_g']:.0f} g", f"{remaining['carbs_g']:.0f} g left")
+        top[3].metric("Fat", f"{consumed['fat_g']:.0f} g", f"{remaining['fat_g']:.0f} g left")
+        render_macro_donut_chart(consumed, goals)
 
     st.subheader("Next Meal Target")
     meal_cols = st.columns(4)
@@ -667,9 +696,6 @@ def render_dashboard() -> None:
 
         if recommendation.get("whoop_warning"):
             st.info(f"WHOOP note: {recommendation['whoop_warning']}")
-
-    render_whoop_status()
-
 
 def main() -> None:
     st.set_page_config(page_title="Whoop Meal AI", page_icon="🥗", layout="wide")

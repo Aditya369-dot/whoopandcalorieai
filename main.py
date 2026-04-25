@@ -23,6 +23,7 @@ from db import (
     save_whoop_tokens,
 )
 from food_import import parse_netdiary_csv
+from lab_import import parse_lab_results_csv
 from recommender import build_daily_brief, next_meal_target, recommend_next_meal
 from whoop_client import WhoopClient, WhoopClientError
 
@@ -47,6 +48,12 @@ class ImportResponse(BaseModel):
 class ImportRowsRequest(BaseModel):
     rows: list[dict]
     day: str
+    source_kind: Optional[str] = None
+    source_path: Optional[str] = None
+
+
+class ImportLabRowsRequest(BaseModel):
+    rows: list[dict]
     source_kind: Optional[str] = None
     source_path: Optional[str] = None
 
@@ -565,6 +572,37 @@ def import_netdiary_rows(payload: ImportRowsRequest):
 def import_status(name: str = Query("mynetdiary_auto")):
     status = get_import_status(name)
     return {"status": status}
+
+
+@app.post("/import/labs/rows")
+def import_lab_rows(payload: ImportLabRowsRequest):
+    if not payload.rows:
+        raise HTTPException(status_code=400, detail="No parsed lab rows were provided.")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    inserted = 0
+    for row in payload.rows:
+        cur.execute(
+            """
+            INSERT INTO lab_results (source, collected_at, day, biomarker, value, unit, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row.get("source", "lab_upload"),
+                row.get("collected_at"),
+                row.get("day"),
+                row.get("biomarker"),
+                row.get("value"),
+                row.get("unit"),
+                row.get("notes"),
+            ),
+        )
+        inserted += 1
+    conn.commit()
+    conn.close()
+
+    return {"inserted_rows": inserted}
 
 
 @app.get("/summary/day")
