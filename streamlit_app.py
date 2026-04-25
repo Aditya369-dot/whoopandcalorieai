@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 import json
 import os
 from typing import Dict
@@ -200,17 +200,15 @@ def render_top_whoop_strip(day_str: str) -> None:
         return
 
     metrics = payload.get("metrics") or {}
-    cols = st.columns(5)
+    st.subheader("WHOOP Core Metrics")
+    st.caption("Today's core readiness signals from WHOOP.")
+    cols = st.columns(3)
     with cols[0]:
-        render_stat_card("Recovery", f"{int(float(metrics.get('recovery') or 0))}%", "Daily readiness", "#22c55e")
+        render_gauge_card("Recovery", float(metrics.get("recovery") or 0), 100.0, "#22c55e", "%")
     with cols[1]:
-        render_stat_card("Sleep", f"{int(float(metrics.get('sleep_performance') or 0))}%", "Sleep performance", "#38bdf8")
+        render_gauge_card("Sleep", float(metrics.get("sleep_performance") or 0), 100.0, "#38bdf8", "%")
     with cols[2]:
-        render_stat_card("Strain", f"{float(metrics.get('strain') or 0):.1f}", "Current day strain", "#f97316")
-    with cols[3]:
-        render_stat_card("HRV", f"{float(metrics.get('hrv_rmssd_milli') or 0):.1f}", "RMSSD", "#a78bfa")
-    with cols[4]:
-        render_stat_card("RHR", f"{int(float(metrics.get('resting_heart_rate') or 0))} bpm", "Resting heart rate", "#ef4444")
+        render_gauge_card("Strain", float(metrics.get("strain") or 0), 21.0, "#f97316")
 
 
 def render_section_banner(title: str, subtitle: str, accent: str) -> None:
@@ -371,172 +369,6 @@ def render_import_status_panel(day_str: str) -> None:
         st.caption(str(status["message"]))
 
 
-def render_whoop_day_overview(day_str: str) -> None:
-    st.subheader("WHOOP Day")
-    st.caption("Recovery, strain, and sleep details pulled from WHOOP for the selected date.")
-    connect_url = f"{API_BASE_URL}/whoop/connect"
-
-    try:
-        status = fetch_api_json("/whoop/status")
-    except RuntimeError:
-        status = {}
-
-    if status.get("reauthorize_required") or status.get("expired"):
-        st.warning("WHOOP session expired. Reconnect to restore live daily metrics.")
-        st.markdown(f"[Reconnect WHOOP]({connect_url})")
-        return
-
-    try:
-        payload = fetch_api_json("/whoop/day", {"day": day_str})
-    except RuntimeError as exc:
-        st.info(f"WHOOP day metrics are not available yet. {exc}")
-        return
-
-    metrics = payload.get("metrics") or {}
-    snapshot = payload.get("snapshot") or {}
-    cycle = snapshot.get("cycle") or {}
-    cycle_score = cycle.get("score") or {}
-    recovery = snapshot.get("recovery") or {}
-    recovery_score = recovery.get("score") or {}
-    sleep = snapshot.get("sleep") or {}
-    sleep_score = sleep.get("score") or {}
-    sleep_stage = sleep_score.get("stage_summary") or {}
-    sleep_needed = sleep_score.get("sleep_needed") or {}
-    workouts = snapshot.get("workouts") or []
-
-    strain = float(metrics.get("strain") or 0)
-    recovery_pct = float(metrics.get("recovery") or 0)
-    sleep_pct = float(metrics.get("sleep_performance") or 0)
-
-    status_bits = []
-    if recovery_pct >= 67:
-        status_bits.append("high recovery")
-    elif recovery_pct > 0:
-        status_bits.append("lower recovery")
-    if strain:
-        status_bits.append(f"{strain:.1f} day strain")
-    if sleep_pct:
-        status_bits.append(f"{int(sleep_pct)}% sleep performance")
-    subtitle = " | ".join(status_bits) if status_bits else "WHOOP data is available for this day."
-    render_section_banner(payload.get("date") or day_str, subtitle, "#22c55e")
-
-    gauge_cols = st.columns(3)
-    with gauge_cols[0]:
-        render_gauge_card("Strain", strain, 21.0, "#f97316")
-    with gauge_cols[1]:
-        render_gauge_card("Recovery", recovery_pct, 100.0, "#22c55e", "%")
-    with gauge_cols[2]:
-        render_gauge_card("Sleep", sleep_pct, 100.0, "#38bdf8", "%")
-
-    headline = st.columns(4)
-    with headline[0]:
-        render_stat_card(
-            "Sleep Duration",
-            f"{float(metrics.get('sleep_hours') or 0):.1f} h",
-            f"Needed: {round((float(sleep_needed.get('baseline_milli') or 0) / 3600000.0), 1):.1f} h baseline"
-            if sleep_needed.get("baseline_milli")
-            else "Based on scored WHOOP sleep",
-            "#38bdf8",
-        )
-    with headline[1]:
-        render_stat_card(
-            "Heart Rate Variability",
-            f"{float(metrics.get('hrv_rmssd_milli') or 0):.1f}",
-            "RMSSD from recovery score",
-            "#22c55e",
-        )
-    with headline[2]:
-        render_stat_card(
-            "Resting Heart Rate",
-            f"{int(metrics.get('resting_heart_rate') or 0)} bpm",
-            f"Avg HR: {int(cycle_score.get('average_heart_rate') or 0)} bpm",
-            "#f97316",
-        )
-    with headline[3]:
-        render_stat_card(
-            "Respiratory Rate",
-            f"{float(sleep_score.get('respiratory_rate') or 0):.1f}",
-            f"Sleep efficiency: {float(sleep_score.get('sleep_efficiency_percentage') or 0):.1f}%",
-            "#a78bfa",
-        )
-
-    st.markdown("##### Sleep Breakdown")
-    sleep_cols = st.columns(4)
-    with sleep_cols[0]:
-        render_stat_card(
-            "Light Sleep",
-            f"{round(float(sleep_stage.get('total_light_sleep_time_milli') or 0) / 3600000.0, 1):.1f} h",
-            "Lighter restorative sleep",
-            "#38bdf8",
-        )
-    with sleep_cols[1]:
-        render_stat_card(
-            "Deep Sleep",
-            f"{round(float(sleep_stage.get('total_slow_wave_sleep_time_milli') or 0) / 3600000.0, 1):.1f} h",
-            "Slow wave sleep",
-            "#6366f1",
-        )
-    with sleep_cols[2]:
-        render_stat_card(
-            "REM Sleep",
-            f"{round(float(sleep_stage.get('total_rem_sleep_time_milli') or 0) / 3600000.0, 1):.1f} h",
-            f"{int(sleep_stage.get('sleep_cycle_count') or 0)} sleep cycles",
-            "#ec4899",
-        )
-    with sleep_cols[3]:
-        render_stat_card(
-            "Disturbances",
-            f"{int(sleep_stage.get('disturbance_count') or 0)}",
-            f"{round(float(sleep_stage.get('total_awake_time_milli') or 0) / 60000.0):.0f} min awake",
-            "#f59e0b",
-        )
-
-    st.markdown("##### Daily Load")
-    load_cols = st.columns(4)
-    with load_cols[0]:
-        render_stat_card(
-            "Average Heart Rate",
-            f"{int(cycle_score.get('average_heart_rate') or 0)} bpm",
-            "Across the daily cycle",
-            "#f97316",
-        )
-    with load_cols[1]:
-        render_stat_card(
-            "Max Heart Rate",
-            f"{int(cycle_score.get('max_heart_rate') or 0)} bpm",
-            "Peak seen in cycle score",
-            "#ef4444",
-        )
-    with load_cols[2]:
-        render_stat_card(
-            "Energy",
-            f"{float(cycle_score.get('kilojoule') or 0):.0f} kJ",
-            "WHOOP cycle energy output",
-            "#14b8a6",
-        )
-    with load_cols[3]:
-        render_stat_card(
-            "Workouts Logged",
-            str(len(workouts)),
-            "Detected in WHOOP for the day",
-            "#22c55e",
-        )
-
-    if workouts:
-        st.markdown("##### Workouts")
-        for workout in workouts:
-            workout_score = workout.get("score") or {}
-            sport_name = workout.get("sport_name") or "Workout"
-            detail_parts = [
-                f"strain {float(workout_score.get('strain') or 0):.1f}",
-                f"avg HR {int(workout_score.get('average_heart_rate') or 0)} bpm",
-                f"max HR {int(workout_score.get('max_heart_rate') or 0)} bpm",
-            ]
-            st.markdown(
-                f"- **{sport_name}**: " + " | ".join(detail_parts)
-            )
-
-
 def render_morning_brief(
     day_str: str,
     *,
@@ -648,7 +480,6 @@ def render_dashboard() -> None:
         protein_g = st.number_input("Protein (g)", min_value=0.0, value=160.0, step=5.0)
         carbs_g = st.number_input("Carbs (g)", min_value=0.0, value=180.0, step=5.0)
         fat_g = st.number_input("Fat (g)", min_value=0.0, value=70.0, step=5.0)
-        insulin_resistant = st.checkbox("Insulin resistant", value=False)
         include_whoop = st.checkbox("Use WHOOP context when available", value=True)
         st.divider()
         st.subheader("Upload MyNetDiary Report")
@@ -688,6 +519,7 @@ def render_dashboard() -> None:
             st.success(f"Imported {inserted} rows for {day_detected or target_day.isoformat()}.")
 
     day_str = target_day.isoformat()
+    nutrition_day = (target_day - timedelta(days=1)).isoformat()
     render_top_whoop_strip(day_str)
     render_import_status_panel(day_str)
     render_morning_brief(
@@ -696,15 +528,14 @@ def render_dashboard() -> None:
         protein_g=protein_g,
         carbs_g=carbs_g,
         fat_g=fat_g,
-        insulin_resistant=insulin_resistant,
+        insulin_resistant=False,
         include_whoop=include_whoop,
     )
-    render_whoop_day_overview(day_str)
 
     summary_payload = fetch_api_json(
         "/summary/day",
         {
-            "day": day_str,
+            "day": nutrition_day,
             "calories": calories,
             "protein_g": protein_g,
             "carbs_g": carbs_g,
@@ -736,7 +567,7 @@ def render_dashboard() -> None:
                 "protein_g": protein_g,
                 "carbs_g": carbs_g,
                 "fat_g": fat_g,
-                "insulin_resistant": str(insulin_resistant).lower(),
+                "insulin_resistant": "false",
                 "include_whoop": str(include_whoop).lower(),
             },
         )
@@ -749,7 +580,8 @@ def render_dashboard() -> None:
         else next_meal_target(consumed, goals)
     )
 
-    st.subheader("Daily Summary")
+    st.subheader("Yesterday's Nutrition Context")
+    st.caption(f"Using nutrition from {nutrition_day} to explain today's WHOOP readiness.")
     top = st.columns(4)
     top[0].metric("Calories", f"{consumed['calories']:.0f}", f"{remaining['calories']:.0f} left")
     top[1].metric("Protein", f"{consumed['protein_g']:.0f} g", f"{remaining['protein_g']:.0f} g left")
